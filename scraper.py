@@ -166,7 +166,7 @@ class HttpClient:
         self.timeout = timeout
         self.retries = retries
         self.delay = delay
-        self.user_agent = "Mozilla/5.0 (compatible; ValeaTemuScraper/1.1)"
+        self.user_agent = "Mozilla/5.0 (compatible; ValeaTemuScraper/1.3)"
 
     def get_json(self, url: str) -> tuple[Any, dict[str, str]]:
         last_error: Exception | None = None
@@ -352,6 +352,45 @@ def variation_size(values: list[tuple[str, str]]) -> str:
     return " / ".join(dict.fromkeys(clean_text(x) for x in size_values if clean_text(x))) or "One Size"
 
 
+def temu_size_selection(size: str) -> tuple[str, str, str]:
+    """Return Temu Size Family, Sub-Size Family and standard Size values.
+
+    Valea's bra sizes extend well beyond Temu's predefined cup-band lists, so
+    those values use Temu's Custom size family while keeping the exact Valea
+    size in both the standard and custom size fields. Common alpha sizes use
+    the regular Temu dropdown values.
+    """
+    original = clean_text(size) or "One Size"
+    normalized = re.sub(r"[\s_-]+", "", original).upper()
+    if normalized in {"ONESIZE", "ONE", "UNIVERSAL", "УНИВЕРСАЛЕН"}:
+        return "2 - Regular Size", "1 - One Size", "one-size"
+
+    alpha_aliases = {
+        "XXS": "XXS",
+        "XS": "XS",
+        "S": "S",
+        "M": "M",
+        "L": "L",
+        "XL": "XL",
+        "XXL": "XXL",
+        "2XL": "XXL",
+        "XXXL": "3XL",
+        "3XL": "3XL",
+        "XXXXL": "4XL",
+        "4XL": "4XL",
+        "5XL": "5XL",
+        "6XL": "6XL",
+        "7XL": "7XL",
+        "8XL": "8XL",
+        "9XL": "9XL",
+        "10XL": "10XL",
+    }
+    if normalized in alpha_aliases:
+        return "2 - Regular Size", "10 - Alpha", alpha_aliases[normalized]
+
+    return "101 - Custom size", "10 - Alpha", original
+
+
 def alpha_size_rank(size: str) -> int:
     normalized = re.sub(r"[^A-Z0-9]", "", size.upper())
     ranks = {"XXS": 0, "XS": 1, "S": 2, "M": 3, "L": 4, "XL": 5, "XXL": 6, "2XL": 6,
@@ -519,6 +558,7 @@ def build_rows(products: list[dict[str, Any]], config: dict[str, Any]) -> list[O
                     variation_colors.append(attr_value)
             size = variation_size(resolved)
             color = temu_color(variation_colors) if variation_colors else base_color
+            size_family, sub_size_family, standard_size = temu_size_selection(size)
             variation_id = int(variation.get("id") or product_id)
             parent_code = f"VALEA-{product_id}"
             sku_code = f"{parent_code}-{variation_id}"
@@ -531,10 +571,18 @@ def build_rows(products: list[dict[str, Any]], config: dict[str, Any]) -> list[O
                 "t_3_Property:12": "Polyamide",
                 "t_3_Property:26": "Solid color",
                 "t_4_Variation Theme": "Color × Size",
+                "t_4_Size Family": size_family,
+                "t_4_Sub-Size Family": sub_size_family,
+                "t_4_Size:3001": standard_size,
+                "t_4_Sale Property:1001": color,
                 "t_4_Custom Spec:1001": color,
                 "t_4_Custom Spec:3001": size,
                 "t_5_Unit": "cm-g-ml",
-                "t_6_Quantity": int(config["default_quantity"]) if product.get("is_in_stock", True) else 0,
+                "t_5_Size Chart Method": "Upload size chart image",
+                "t_5_Size Chart Image": config["size_chart_image_url"],
+                "t_6_Quantity": int(config["default_quantity"])
+                if variation.get("is_in_stock", product.get("is_in_stock", True))
+                else 0,
                 "t_6_Base Price - EUR": float(base_price),
                 "t_6_Reference Link": str(product.get("permalink") or ""),
                 "t_6_List Price - EUR": float(list_price),
@@ -809,6 +857,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "handling_time": "1 Day",
         "country_of_origin": "Bulgaria",
         "manufacturer": "VALEA BG 10 Ltd",
+        "size_chart_image_url": "https://valea.bg/wp-content/uploads/2025/04/size-table.jpg",
         "max_rows_per_file": 1900,
     }
     if path.exists():
