@@ -1,0 +1,13 @@
+{
+  "base_price_factor": 0.89,
+  "default_quantity": 100,
+  "package_weight_g": 150,
+  "package_length_cm": 20,
+  "package_width_cm": 15,
+  "package_height_cm": 5,
+  "shipping_template": "Офис",
+  "handling_time": "1 Day",
+  "country_of_origin": "Bulgaria",
+  "manufacturer": "VALEA BG 10 Ltd",
+  "max_rows_per_file": 1900
+}
