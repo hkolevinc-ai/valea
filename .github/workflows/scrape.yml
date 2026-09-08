@@ -1,0 +1,45 @@
+name: Valea to Temu scraper
+
+on:
+  workflow_dispatch:
+    inputs:
+      product_limit:
+        description: "Product limit (empty or 0 = all)"
+        required: false
+        default: "0"
+      search:
+        description: "Optional product search text"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run scraper
+        shell: bash
+        run: |
+          python -m unittest discover -s tests -v
+          python scraper.py \
+            --limit-products "${{ inputs.product_limit || '0' }}" \
+            --search "${{ inputs.search }}"
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: valea-temu-results
+          path: results/
+          if-no-files-found: error
+          retention-days: 14
