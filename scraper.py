@@ -13,7 +13,6 @@ import argparse
 import csv
 import html
 import json
-import math
 import os
 import re
 import shutil
@@ -166,7 +165,7 @@ class HttpClient:
         self.timeout = timeout
         self.retries = retries
         self.delay = delay
-        self.user_agent = "Mozilla/5.0 (compatible; ValeaTemuScraper/1.3)"
+        self.user_agent = "Mozilla/5.0 (compatible; ValeaTemuScraper/1.4)"
 
     def get_json(self, url: str) -> tuple[Any, dict[str, str]]:
         last_error: Exception | None = None
@@ -310,10 +309,18 @@ def product_attribute_maps(product: dict[str, Any]) -> tuple[dict[str, dict[str,
     return term_maps, display_values
 
 
-def resolve_attribute(term_maps: dict[str, dict[str, str]], name: str, value: str) -> str:
+def resolve_attribute(term_maps: dict[str, dict[str, str]], name: str, value: Any) -> str:
+    cleaned = clean_text(value)
+    if not cleaned or cleaned.casefold() in {"none", "null", "n/a"}:
+        return ""
     mapping = term_maps.get(clean_text(name).casefold(), {})
-    decoded = urllib.parse.unquote(str(value)).casefold()
-    return mapping.get(decoded) or mapping.get(clean_text(value).casefold()) or clean_text(value)
+    decoded = urllib.parse.unquote(cleaned).casefold()
+    return mapping.get(decoded) or mapping.get(cleaned.casefold()) or cleaned
+
+
+def is_color_attribute(name: str) -> bool:
+    normalized = clean_text(name).casefold()
+    return "цвят" in normalized or "color" in normalized
 
 
 def temu_color(raw_colors: Iterable[str]) -> str:
@@ -519,8 +526,21 @@ class OutputRow:
     values: dict[str, Any]
 
 
-def build_rows(products: list[dict[str, Any]], config: dict[str, Any]) -> list[OutputRow]:
+def build_rows(
+    products: list[dict[str, Any]],
+    config: dict[str, Any],
+    stats: dict[str, int] | None = None,
+) -> list[OutputRow]:
     rows: list[OutputRow] = []
+    if stats is None:
+        stats = {}
+    for key in (
+        "inferred_color_variations",
+        "skipped_invalid_variations",
+        "skipped_duplicate_variations",
+        "products_without_valid_rows",
+    ):
+        stats.setdefault(key, 0)
     factor = Decimal(str(config["base_price_factor"]))
     for product_index, product in enumerate(products, 1):
         product_id = int(product.get("id", 0))
@@ -529,9 +549,27 @@ def build_rows(products: list[dict[str, Any]], config: dict[str, Any]) -> list[O
         term_maps, display_values = product_attribute_maps(product)
         color_values: list[str] = []
         for attr_name, values in display_values.items():
-            if "цвят" in attr_name or "color" in attr_name:
+            if is_color_attribute(attr_name):
                 color_values.extend(values)
         base_color = temu_color(color_values)
+        variation_attribute_names = {
+            clean_text(attribute.get("name")).casefold()
+            for attribute in product.get("attributes", [])
+            if attribute.get("has_variations") and clean_text(attribute.get("name"))
+        }
+        required_size_attribute_names = {
+            name for name in variation_attribute_names if not is_color_attribute(name)
+        }
+        declared_variation_colors: list[str] = []
+        for attribute in product.get("attributes", []):
+            if not attribute.get("has_variations") or not is_color_attribute(attribute.get("name")):
+                continue
+            declared_variation_colors.extend(
+                clean_text(term.get("name"))
+                for term in attribute.get("terms", [])
+                if clean_text(term.get("name"))
+            )
+        declared_variation_colors = list(dict.fromkeys(declared_variation_colors))
         description = clean_text(product.get("description") or product.get("short_description"), 2000)
         bullets = [line.strip(" -–•") for line in description.splitlines() if line.strip(" -–•")]
         bullets = list(dict.fromkeys(bullets))[:6]
@@ -544,20 +582,49 @@ def build_rows(products: list[dict[str, Any]], config: dict[str, Any]) -> list[O
         base_price = (current_price * factor).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         if base_price >= list_price:
             base_price = max(Decimal("0.01"), list_price - Decimal("0.01"))
-        variations = product.get("variations") or []
-        if not variations:
+        source_variations = product.get("variations") or []
+        variations = source_variations
+        if not source_variations:
             variations = [{"id": product_id, "attributes": []}]
+        missing_color_occurrences: dict[tuple[tuple[str, str], ...], int] = {}
+        seen_specs: set[tuple[str, str]] = set()
+        generated_for_product = 0
         for variation_index, variation in enumerate(variations, 1):
             resolved: list[tuple[str, str]] = []
             variation_colors: list[str] = []
+            raw_attributes: dict[str, Any] = {}
             for attribute in variation.get("attributes", []):
                 attr_name = clean_text(attribute.get("name"))
-                attr_value = resolve_attribute(term_maps, attr_name, str(attribute.get("value", "")))
+                raw_value = attribute.get("value")
+                raw_attributes[attr_name.casefold()] = raw_value
+                attr_value = resolve_attribute(term_maps, attr_name, raw_value)
                 resolved.append((attr_name, attr_value))
-                if "цвят" in attr_name.casefold() or "color" in attr_name.casefold():
+                if is_color_attribute(attr_name) and attr_value:
                     variation_colors.append(attr_value)
+            if source_variations and any(
+                not resolve_attribute(term_maps, attribute_name, raw_attributes.get(attribute_name))
+                for attribute_name in required_size_attribute_names
+            ):
+                stats["skipped_invalid_variations"] += 1
+                continue
+            if not variation_colors and declared_variation_colors:
+                group_key = tuple(
+                    sorted(
+                        (name, resolve_attribute(term_maps, name, raw_attributes.get(name)).casefold())
+                        for name in required_size_attribute_names
+                    )
+                )
+                occurrence = missing_color_occurrences.get(group_key, 0)
+                variation_colors = [declared_variation_colors[occurrence % len(declared_variation_colors)]]
+                missing_color_occurrences[group_key] = occurrence + 1
+                stats["inferred_color_variations"] += 1
             size = variation_size(resolved)
             color = temu_color(variation_colors) if variation_colors else base_color
+            spec_key = (size.casefold(), color.casefold())
+            if spec_key in seen_specs:
+                stats["skipped_duplicate_variations"] += 1
+                continue
+            seen_specs.add(spec_key)
             size_family, sub_size_family, standard_size = temu_size_selection(size)
             variation_id = int(variation.get("id") or product_id)
             parent_code = f"VALEA-{product_id}"
@@ -607,7 +674,12 @@ def build_rows(products: list[dict[str, Any]], config: dict[str, Any]) -> list[O
                 row_values[f"__detail_image_{i}"] = image_url
                 row_values[f"__sku_image_{i}"] = image_url
             rows.append(OutputRow(product_id, name, category, size, color, row_values))
-        print(f"[{product_index}/{len(products)}] {name}: {len(variations)} size row(s)")
+            generated_for_product += 1
+        if not generated_for_product:
+            stats["products_without_valid_rows"] += 1
+        print(
+            f"[{product_index}/{len(products)}] {name}: {generated_for_product} valid size row(s)"
+        )
     return rows
 
 
@@ -797,6 +869,8 @@ class TemuWorkbook:
 
     def write(self, output_path: Path, rows: list[OutputRow]) -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = output_path.with_name(output_path.name + ".tmp")
+        temporary_path.unlink(missing_ok=True)
         with zipfile.ZipFile(self.template_path, "r") as source:
             sheet_xml = source.read(self.sheet_member)
             root = ET.fromstring(sheet_xml)
@@ -839,10 +913,19 @@ class TemuWorkbook:
                 row_element.extend(ordered)
 
             new_sheet_xml = ET.tostring(root, encoding="utf-8", xml_declaration=True)
-            with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as target:
+            with zipfile.ZipFile(temporary_path, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as target:
                 for item in source.infolist():
                     payload = new_sheet_xml if item.filename == self.sheet_member else source.read(item.filename)
                     target.writestr(item, payload)
+        try:
+            with zipfile.ZipFile(temporary_path, "r") as generated:
+                bad_member = generated.testzip()
+            if bad_member:
+                raise RuntimeError(f"Generated workbook contains a damaged member: {bad_member}")
+            os.replace(temporary_path, output_path)
+        except Exception:
+            temporary_path.unlink(missing_ok=True)
+            raise
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -867,21 +950,49 @@ def load_config(path: Path) -> dict[str, Any]:
     return defaults
 
 
-def chunks(rows: list[OutputRow], maximum: int) -> Iterable[list[OutputRow]]:
-    for start in range(0, len(rows), maximum):
-        yield rows[start : start + maximum]
+def chunks_by_product(rows: list[OutputRow], maximum: int) -> Iterable[list[OutputRow]]:
+    """Split rows without placing one parent product in multiple workbooks."""
+    if maximum < 1:
+        raise ValueError("maximum rows per file must be positive")
+    current: list[OutputRow] = []
+    start = 0
+    while start < len(rows):
+        product_id = rows[start].product_id
+        end = start + 1
+        while end < len(rows) and rows[end].product_id == product_id:
+            end += 1
+        product_rows = rows[start:end]
+        if len(product_rows) > maximum:
+            raise ValueError(
+                f"Product {product_id} has {len(product_rows)} rows, exceeding the per-file limit {maximum}"
+            )
+        if current and len(current) + len(product_rows) > maximum:
+            yield current
+            current = []
+        current.extend(product_rows)
+        start = end
+    if current:
+        yield current
 
 
-def write_report(output_dir: Path, products: list[dict[str, Any]], rows: list[OutputRow], config: dict[str, Any]) -> None:
+def write_report(
+    output_dir: Path,
+    products: list[dict[str, Any]],
+    rows: list[OutputRow],
+    parts: list[list[OutputRow]],
+    stats: dict[str, int],
+) -> None:
     report = {
         "source": "https://valea.bg/",
         "products": len(products),
         "sku_rows": len(rows),
-        "parts": math.ceil(len(rows) / int(config["max_rows_per_file"])),
+        "parts": len(parts),
+        "cleanup": stats,
         "composition": COMPOSITION,
         "category_counts": {},
         "notes": [
-            "One workbook row is created for every configured Valea variation.",
+            "One workbook row is created for every unique, valid Valea size/color variation.",
+            "A parent product is never split across two workbook parts.",
             "Valea does not expose official size-chart measurements via its Store API; size-based defaults are centralized in size_measurements().",
             "EU Responsible person is intentionally blank because the configured manufacturer is in Bulgaria (EU).",
         ],
@@ -900,9 +1011,11 @@ def write_report(output_dir: Path, products: list[dict[str, Any]], rows: list[Ou
 def make_results_zip(output_dir: Path) -> Path:
     zip_path = output_dir / "valea-temu-results.zip"
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
-        for path in sorted(output_dir.iterdir()):
-            if path == zip_path or not path.is_file():
-                continue
+        result_files = sorted(output_dir.glob("TEMU_VALEA_UPLOAD_part_*.xlsx"))
+        result_files.extend([output_dir / "rows-preview.csv", output_dir / "scrape-report.json"])
+        for path in result_files:
+            if not path.is_file():
+                raise RuntimeError(f"Expected result file is missing: {path}")
             archive.write(path, path.name)
     return zip_path
 
@@ -931,20 +1044,32 @@ def main() -> int:
     if not products:
         print("ERROR: No matching Valea products were found", file=sys.stderr)
         return 3
-    rows = build_rows(products, config)
+    cleanup_stats: dict[str, int] = {}
+    rows = build_rows(products, config, cleanup_stats)
     if not rows:
         print("ERROR: Products were found but no SKU rows were generated", file=sys.stderr)
         return 4
     output_dir.mkdir(parents=True, exist_ok=True)
-    for old in output_dir.glob("TEMU_VALEA_UPLOAD_part_*.xlsx"):
+    for old in output_dir.glob("TEMU_VALEA_UPLOAD_part_*.xlsx*"):
         old.unlink()
     workbook = TemuWorkbook(template_path)
     max_rows = int(config["max_rows_per_file"])
-    for part_number, part_rows in enumerate(chunks(rows, max_rows), 1):
+    parts = list(chunks_by_product(rows, max_rows))
+    for part_number, part_rows in enumerate(parts, 1):
         output_path = output_dir / f"TEMU_VALEA_UPLOAD_part_{part_number:03d}.xlsx"
         print(f"Writing {output_path.name}: {len(part_rows)} rows …")
-        workbook.write(output_path, part_rows)
-    write_report(output_dir, products, rows, config)
+        for attempt in range(1, 4):
+            try:
+                workbook.write(output_path, part_rows)
+                break
+            except (zipfile.BadZipFile, RuntimeError, OSError) as exc:
+                output_path.unlink(missing_ok=True)
+                if attempt == 3:
+                    raise
+                print(f"  workbook verification failed ({exc}); retrying {attempt}/3 …")
+    for leftover in output_dir.glob("TEMU_VALEA_UPLOAD_part_*.xlsx.tmp"):
+        leftover.unlink()
+    write_report(output_dir, products, rows, parts, cleanup_stats)
     zip_path = make_results_zip(output_dir)
     print(f"DONE: {len(products)} products, {len(rows)} SKU rows, {zip_path}")
     return 0
