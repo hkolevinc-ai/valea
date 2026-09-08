@@ -1,6 +1,7 @@
 import unittest
+import urllib.parse
 
-from scraper import select_temu_category, temu_color, variation_size
+from scraper import fetch_products, select_temu_category, temu_color, variation_size
 
 
 def product(name, *slugs):
@@ -36,6 +37,29 @@ class ScraperLogicTests(unittest.TestCase):
     def test_color_mapping(self):
         self.assertEqual(temu_color(["Черно"]), "Black")
         self.assertEqual(temu_color(["Черно", "Червено"]), "Multicolor")
+
+    def test_api_page_size_falls_back_after_server_error(self):
+        class FakeClient:
+            def __init__(self):
+                self.page_sizes = []
+
+            def get_json(self, url):
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+                page_size = int(query["per_page"][0])
+                page = int(query["page"][0])
+                self.page_sizes.append(page_size)
+                if page_size > 10:
+                    raise RuntimeError("HTTP Error 500: Internal Server Error")
+                items = [
+                    {"id": 101, "parent": 0, "categories": [{"slug": "sutieni"}]},
+                    {"id": 102, "parent": 0, "categories": [{"slug": "bikini"}]},
+                ]
+                return (items if page == 1 else []), {"x-wp-totalpages": "1"}
+
+        client = FakeClient()
+        result = fetch_products(client)
+        self.assertEqual([item["id"] for item in result], [101, 102])
+        self.assertEqual(client.page_sizes, [25, 10])
 
 
 if __name__ == "__main__":

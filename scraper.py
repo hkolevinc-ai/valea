@@ -166,7 +166,7 @@ class HttpClient:
         self.timeout = timeout
         self.retries = retries
         self.delay = delay
-        self.user_agent = "Mozilla/5.0 (compatible; ValeaTemuScraper/1.0)"
+        self.user_agent = "Mozilla/5.0 (compatible; ValeaTemuScraper/1.1)"
 
     def get_json(self, url: str) -> tuple[Any, dict[str, str]]:
         last_error: Exception | None = None
@@ -192,34 +192,76 @@ class HttpClient:
         raise RuntimeError(f"Could not fetch {url}: {last_error}")
 
 
-def fetch_products(client: HttpClient, search: str = "", limit: int = 0) -> list[dict[str, Any]]:
+def fetch_products_page_size(
+    client: HttpClient,
+    page_size: int,
+    search: str = "",
+    limit: int = 0,
+) -> list[dict[str, Any]]:
+    """Fetch all matching products with one fixed WooCommerce page size."""
     products: list[dict[str, Any]] = []
+    product_ids: set[int] = set()
     page = 1
     total_pages: int | None = None
     while total_pages is None or page <= total_pages:
-        params = {"per_page": "100", "page": str(page)}
+        params = {"per_page": str(page_size), "page": str(page)}
         if search:
             params["search"] = search
         url = f"{API_BASE}/products?{urllib.parse.urlencode(params)}"
-        print(f"Fetching products page {page}{f'/{total_pages}' if total_pages else ''} …")
+        print(
+            f"Fetching products page {page}{f'/{total_pages}' if total_pages else ''} "
+            f"({page_size} per request) …"
+        )
         batch, headers = client.get_json(url)
         if not isinstance(batch, list):
             raise RuntimeError("Valea API returned an unexpected products response")
         if total_pages is None:
-            total_pages = int(headers.get("x-wp-totalpages", "1"))
+            header_total = headers.get("x-wp-totalpages")
+            total_pages = int(header_total) if header_total else None
         for product in batch:
             if product.get("parent"):
                 continue
             category_slugs = {str(cat.get("slug", "")) for cat in product.get("categories", [])}
             if category_slugs and not (category_slugs & ROOT_CATEGORY_SLUGS):
                 continue
+            product_id = int(product.get("id") or 0)
+            if product_id and product_id in product_ids:
+                continue
             products.append(product)
+            if product_id:
+                product_ids.add(product_id)
             if limit and len(products) >= limit:
                 return products[:limit]
         if not batch:
             break
+        if total_pages is None and len(batch) < page_size:
+            break
         page += 1
     return products[:limit] if limit else products
+
+
+def fetch_products(client: HttpClient, search: str = "", limit: int = 0) -> list[dict[str, Any]]:
+    """Fetch products, automatically reducing request size after server errors.
+
+    Valea's Store API sometimes returns HTTP 500 for large collection requests.
+    Restarting pagination is required when page size changes because page numbers
+    point to different product offsets.
+    """
+    page_sizes = (25, 10, 5, 1)
+    last_error: RuntimeError | None = None
+    for attempt, page_size in enumerate(page_sizes, 1):
+        try:
+            return fetch_products_page_size(client, page_size, search=search, limit=limit)
+        except RuntimeError as exc:
+            last_error = exc
+            if attempt == len(page_sizes):
+                break
+            next_size = page_sizes[attempt]
+            print(
+                f"Valea API failed with {page_size} products per request: {exc}\n"
+                f"Restarting safely with {next_size} products per request …"
+            )
+    raise RuntimeError(f"Valea API failed even with one product per request: {last_error}")
 
 
 def select_temu_category(product: dict[str, Any]) -> str:
