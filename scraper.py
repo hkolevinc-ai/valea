@@ -165,7 +165,7 @@ class HttpClient:
         self.timeout = timeout
         self.retries = retries
         self.delay = delay
-        self.user_agent = "Mozilla/5.0 (compatible; ValeaTemuScraper/1.4)"
+        self.user_agent = "Mozilla/5.0 (compatible; ValeaTemuScraper/1.5)"
 
     def get_json(self, url: str) -> tuple[Any, dict[str, str]]:
         last_error: Exception | None = None
@@ -542,6 +542,7 @@ def build_rows(
     ):
         stats.setdefault(key, 0)
     factor = Decimal(str(config["base_price_factor"]))
+    sku_prefix = slugify(str(config.get("sku_prefix") or "VALEA-V2"))
     for product_index, product in enumerate(products, 1):
         product_id = int(product.get("id", 0))
         name = clean_text(product.get("name"), 500)
@@ -627,7 +628,7 @@ def build_rows(
             seen_specs.add(spec_key)
             size_family, sub_size_family, standard_size = temu_size_selection(size)
             variation_id = int(variation.get("id") or product_id)
-            parent_code = f"VALEA-{product_id}"
+            parent_code = f"{sku_prefix}-{product_id}"
             sku_code = f"{parent_code}-{variation_id}"
             row_values: dict[str, Any] = {
                 "t_1_Category": category,
@@ -940,6 +941,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "handling_time": "1 Day",
         "country_of_origin": "Bulgaria",
         "manufacturer": "VALEA BG 10 Ltd",
+        "sku_prefix": "VALEA-V2",
         "size_chart_image_url": "https://valea.bg/wp-content/uploads/2025/04/size-table.jpg",
         "max_rows_per_file": 1900,
     }
@@ -993,6 +995,7 @@ def write_report(
         "notes": [
             "One workbook row is created for every unique, valid Valea size/color variation.",
             "A parent product is never split across two workbook parts.",
+            "Contribution Goods, Contribution SKU and the governance identifier use the configured sku_prefix.",
             "Valea does not expose official size-chart measurements via its Store API; size-based defaults are centralized in size_measurements().",
             "EU Responsible person is intentionally blank because the configured manufacturer is in Bulgaria (EU).",
         ],
