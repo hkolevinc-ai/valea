@@ -89,6 +89,40 @@ class ScraperLogicTests(unittest.TestCase):
             "https://valea.bg/wp-content/uploads/2025/04/size-table.jpg",
         )
 
+    def test_configured_sku_prefix_is_used_for_all_linked_identifiers(self):
+        source = {
+            "id": 123,
+            "name": "Тестов сутиен",
+            "categories": [{"slug": "sutieni"}],
+            "variations": [{"id": 456, "attributes": []}],
+            "prices": {"price": "2000", "regular_price": "2500", "currency_minor_unit": 2},
+            "images": [],
+            "is_in_stock": True,
+        }
+        config = load_config(Path("/definitely/missing/config.json"))
+        output = build_rows([source], config)[0].values
+        self.assertEqual(output["t_1_Contribution Goods"], "VALEA-V2-123")
+        self.assertEqual(output["t_1_Contribution SKU"], "VALEA-V2-123-456")
+        self.assertEqual(
+            output["t_8_Governance Property:1100100115"],
+            "VALEA-V2-123",
+        )
+        self.assertNotEqual(output["t_1_Contribution Goods"], "VALEA-123")
+
+    def test_sku_prefix_is_sanitized_for_temu_identifiers(self):
+        source = {
+            "id": 5,
+            "name": "Тестов продукт",
+            "categories": [{"slug": "bikini"}],
+            "prices": {"price": "2000", "regular_price": "2500", "currency_minor_unit": 2},
+            "images": [],
+        }
+        config = load_config(Path("/missing"))
+        config["sku_prefix"] = " Valea nova versiya "
+        output = build_rows([source], config)[0].values
+        self.assertEqual(output["t_1_Contribution Goods"], "VALEA-NOVA-VERSIYA-5")
+        self.assertEqual(output["t_1_Contribution SKU"], "VALEA-NOVA-VERSIYA-5-5")
+
     def test_missing_variation_colors_are_inferred_from_declared_terms(self):
         source = {
             "id": 2,
